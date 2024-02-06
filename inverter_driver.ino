@@ -45,8 +45,8 @@
  *     /480 =  50 kHz
  *     /600 =  40 kHz
  * 
- * To generate the reference sine waves, we configure another GCLK or
- * TCC instance to run at 240 kHz (for 50 Hz output) or 200 kHz (for
+ * To generate the reference sine waves, we configure another 
+ * TC instance to run at 240 kHz (for 50 Hz output) or 200 kHz (for
  * 60 Hz output).  We generate an interrupt on each tick, which is
  * used to update the DAC output value.  At startup time, generate a
  * 4000 entry sine wave table to be used for setting the DAC outputs.
@@ -54,7 +54,17 @@
  * giving each output a different index into the table.  If we ever
  * want to generate 3-phase outputs, the sine wave table size should
  * be divisible by 3, but we don't consider it for now, since the
- * devices we use  only have two DACs.
+ * devices we use only have two DACs.
+ * 
+ * The dialog between this machine (the inverter driver) and the main
+ * controller (the interface controller) will support the following
+ * RPCs:
+ *     1. Get/set L1 throttle (1..2047)
+ *     2. Get/set L2 throttle (1..2047)
+ *     3. Get/set neutral bias (+- 200)
+ *     4. Get/set main on/off signal (0..1)
+ *     5. Get/set L1 on/off signal (0..1)
+ *     6. Get/set L2 on/off signal (0..1)
  * 
  * TODO: Devise a start up sequence that will prime the bootstrap
  * capacitor.  To do this, generate a low reference, and enable the
@@ -91,11 +101,41 @@ uint32_t clockPin = A5;
 unsigned long nextLoopMs = 0;
 const unsigned long intervalMs = 1000;
 
+// on/off signal values
+uint8_t mainOnOff = 0;
+uint8_t l1OnOff = 0;
+uint8_t l2OnOff = 0;
+
 // Since wave generation
 const uint16_t numSamples = 4000;
-uint16_t rawSineData[numSamples];
-uint16_t l1Index = 0;
-uint16_t l2Index = numSamples / 2;
+const uint16_t numBits = 12;
+const uint16_t maxDacValue = 1 << numBits;
+const double midDacValue = maxDacValue / 2;
+const uint16_t maxDacAmplitude = midDacValue - 1;
+const uint16_t minDacAmplitude = 0 - maxDacAmplitude;
+double rawSineData[numSamples];
+uint16_t neutralBias = 0;
+
+/*
+ * Data for generating an output reference sine wave for a single channel.
+ * Since each line may have a different load, it will have a different throttle
+ * setting, so we need separate arrays for L1 and L2.
+ */
+typedef struct {
+  uint16_t throttle;
+  uint16_t index;
+  uint16_t sineDataA[numSamples];
+  uint16_t sineDataB[numSamples];
+  uint16_t* sineData;
+  bool usingDataA;
+} LineData;
+
+LineData l1;
+LineData l2;
+  
+const uint16_t maxThrottle = 2047;
+const uint16_t defaultThrottle = 1850;
+
 
 volatile uint32_t tc5IrqNumRaw = 0;
 volatile uint32_t tc5IrqElapsed = 0;
@@ -161,27 +201,51 @@ void setupSineData() {
   const double pi = 3.14159265359;
   const double pi2 = 2.0 * pi;
   const double dNumSamples = numSamples;
-  const uint16_t numBits = 12;
-  const uint16_t maxDacValue = 1 << numBits;
-  const double midDacValue = maxDacValue / 2;
-  const double dacAmplitude = midDacValue - 1;
+  
+  // initialize the line struct for L1 and L2
+  l1.index = 0;
+  l2.index = numSamples / 2;
+  l1.throttle = defaultThrottle;
+  l2.throttle = defaultThrottle;
+  l1.usingDataA = 1;
+  l2.usingDataA = 1;
+  l1.sineData = l1.sineDataA;
+  l2.sineData = l2.sineDataA;
   
   for (int i = 0; i < numSamples; i++) {
-    double sineValue = sin((double) i * pi2 / dNumSamples);
-    
-    // generate PWM values for 100% output, it will be throttled at runtime
-    double rawSin = sineValue * dacAmplitude;
-    if (rawSin > 0) {
-      rawSin += 0.5;
-    } else if (rawSin < 0) {
-      rawSin -= 0.5;
-    }
-    rawSineData[i] = (int16_t)(rawSin + midDacValue);
+    rawSineData[i] = sin((double) i * pi2 / dNumSamples);
   }
+  
+  updateSineData(&l1);
+  updateSineData(&l2);
+  
   uint32_t elapsedTicks = DWT->CYCCNT - startTicks;
   double elapsedMs = (double) elapsedTicks * 1000.0 / cpuClkFrequency;
   Serial.printf("Elapsed time ticks=%d  ms=", elapsedTicks);
   Serial.println(elapsedMs, 3);
+}
+
+/*
+ * Update the sine wave array based on current throttle and bias settings.
+ */
+void updateSineData(LineData* ld) {
+  uint16_t* nextSineData = ld->usingDataA ? ld->sineDataB : ld->sineDataA;
+  
+  uint16_t effectiveNeutralBias = neutralBias;
+  if (effectiveNeutralBias + ld->throttle > maxDacAmplitude) {
+    effectiveNeutralBias = maxDacAmplitude - ld->throttle;
+  } else if (effectiveNeutralBias - ld->throttle < minDacAmplitude) {
+    effectiveNeutralBias = minDacAmplitude + ld->throttle;
+  }
+  
+  for (int i = 0; i < numSamples; i++) {
+    nextSineData[i] = rawSineData[i] * ld->throttle + midDacValue + effectiveNeutralBias;
+  }
+  
+  ld->usingDataA = !ld->usingDataA;
+  ld->sineData = nextSineData;
+  
+  Serial.printf("usingDataA=%d  !usingDataA=%d\n", ld->usingDataA, !ld->usingDataA);
 }
 
 /*
@@ -342,18 +406,18 @@ void TC5_Handler() {
   if (intFlags & TC_INTENSET_OVF) {
     while ( !DAC->STATUS.bit.READY0 );         // update DAC0 value for line 1
     while (DAC->SYNCBUSY.bit.DATA0);
-    DAC->DATA[0].reg = rawSineData[l1Index];
-    l1Index += 1;
-    if (l1Index >= numSamples) {
-      l1Index = 0;
+    DAC->DATA[0].reg = l1.sineData[l1.index];
+    l1.index += 1;
+    if (l1.index >= numSamples) {
+      l1.index = 0;
     }
       
     while ( !DAC->STATUS.bit.READY1 );         // update DAC1 value for line 2
     while (DAC->SYNCBUSY.bit.DATA1);
-    DAC->DATA[1].reg = rawSineData[l2Index];
-    l2Index += 1;
-    if (l2Index >= numSamples) {
-      l2Index = 0;
+    DAC->DATA[1].reg = l2.sineData[l2.index];
+    l2.index += 1;
+    if (l2.index >= numSamples) {
+      l2.index = 0;
     }
     
     intFlags &= !TC_INTENSET_OVF;
