@@ -3,6 +3,12 @@
  * models that have at least 2 DACs.  SAMD21 processors have only 1 DAC
  * and would thus be able to generate only 1 reference sine wave.
  * 
+ * The driver controller's main priority is to deliver quality reference sine
+ * waves and the clock signal, which is very timing critical.  A separate
+ * component called the interface controller communicates to this inverter
+ * driver, and also battery charge controllers, BMS instances, user display
+ * terminals, and smart load balancers.
+ * 
  * This app runs in the Arduino environment.
  * 
  * This code has been tested and verified on an Adafruit Feather M4 Express.
@@ -10,7 +16,7 @@
  * 
  * This app does 3 tasks:
  * done 1. Generates a clock signal that determines the timing of MOSFET
- *         switching in the inverter.  The clock timing ranges from 10s kHz
+ *         switching in the inverter.  The clock timing ranges from a few kHz
  *         to 1 MHz.
  * done 2. For each output line, generate a reference sine wave.  For split
  *         phase inverters, there will be 2 output sine waves with 180 degrees
@@ -23,48 +29,85 @@
  *         critical components.  The communication between this app and the
  *         separate processor can be UART (slow) or SPI (fast).
  * 
- * The output clock signal is generated using a TC instance with the 48 MHz
- * clock input with appropriate settings to get one of the following output
- * frequencies.  Since the output is toggled in each TC match, the counter
- * value should be 1/2 of the total number of clock pulses in each cycle.
- * Other frequencies are possible, these are just the most common.
  * 
- *        48 MHz
- *     /24  =   1 MHz
- *     /32  = 750 kHz
- *     /40  = 600 kHz
- *     /48  = 500 kHz
- *     /60  = 400 kHz
- *     /80  = 300 kHz
- *     /96  = 250 kHz
- *     /120 = 200 kHz
- *     /192 = 125 kHz
- *     /240 = 100 kHz
- *     /320 =  75 kHz
- *     /400 =  60 kHz
- *     /480 =  50 kHz
- *     /600 =  40 kHz
+ * SWITCHING CLOCK
  * 
- * To generate the reference sine waves, we configure another 
- * TC instance to run at 240 kHz (for 50 Hz output) or 200 kHz (for
- * 60 Hz output).  We generate an interrupt on each tick, which is
- * used to update the DAC output value.  At startup time, generate a
- * 4000 entry sine wave table to be used for setting the DAC outputs.
+ * The output clock signal is generated one of two ways (slight preference for #1):
+ *     1. Using the Si5351 clock chip.  This will provide a more precise clock
+ *        than using the TC method described below.  For higher frequencies that
+ *        might interfere with broadcast radio, the Si5351 can do spread spectrum,
+ *        which can keep the communications authorities from knocking on your
+ *        door.  Assuming you can find a library that implements it.  (Another
+ *        item on my TODO list.)  I use the Adafruit breakout board for testing.
+ *     2. Using a TC instance with the 48 MHz clock input with appropriate
+ *        settings to get one of the following output frequencies.  Since the
+ *        output is toggled in each TC match, the counter value should be 1/2
+ *        of the total number of clock pulses in each cycle.
+ * 
+ *        Other frequencies are possible, these are just the most common.
+ * 
+ *           48 MHz
+ *        /24  =   1 MHz
+ *        /32  = 750 kHz
+ *        /40  = 600 kHz
+ *        /48  = 500 kHz
+ *        /60  = 400 kHz
+ *        /80  = 300 kHz
+ *        /96  = 250 kHz
+ *        /120 = 200 kHz
+ *        /192 = 125 kHz
+ *        /240 = 100 kHz
+ *        /320 =  75 kHz
+ *        /400 =  60 kHz
+ *        /480 =  50 kHz
+ *        /600 =  40 kHz
+ * 
+ * 
+ * REFERENCE SINE WAVE
+ * 
+ * To generate the reference sine waves, we use a 4000 entry sine wave table
+ * that is filled in at startup time.  The SAMD51 supports native floating 
+ * point instructions, so this is pretty fast.  We generate interrupts at a
+ * frequency range of 160-280 kHz to drive the DACs to generate sine waves
+ * at frequencies from 40-70 Hz.
+ * 
  * One sine wave table works for multiple output reference waves, by
  * giving each output a different index into the table.  If we ever
  * want to generate 3-phase outputs, the sine wave table size should
  * be divisible by 3, but we don't consider it for now, since the
  * devices we use only have two DACs.
  * 
+ * Like with the switching clock, the sine wave generation can be driven by
+ * either the Si5351 or a TC instance.  In this case, I have a strong preference
+ * for using the Si5351, since it can be used to generate sine wave frequencies
+ * accurate down to 0.01 Hz.  The TC instance is way less precise.
+ * 
+ * Note that we do not yet support synchronizing to an external grid.  The best
+ * way to do that is with a dual second order generalized integrator phase lock
+ * loop (DSOGI PLL).  This, too, is on the TODO list.
+ * 
+ * For grid-tie synchronization using a SOGI PLL, see
+ *     https://www.instructables.com/STM32-Duino-Grid-Tie-PLL/
+ * 
+ * 
+ * CONTROL COMMUNICATIONS
+ * 
  * The dialog between this machine (the inverter driver) and the main
  * controller (the interface controller) will support the following
- * RPCs:
- *     1. Get/set L1 throttle (1..2047)
- *     2. Get/set L2 throttle (1..2047)
- *     3. Get/set neutral bias (+- 200)
- *     4. Get/set main on/off signal (0..1)
- *     5. Get/set L1 on/off signal (0..1)
- *     6. Get/set L2 on/off signal (0..1)
+ * requests:
+ *     1. [aA] Get/set L1 throttle (1..2047)
+ *     2. [bB] Get/set L2 throttle (1..2047)
+ *     3. [cC] Get/set L1 on/off signal (0..1)
+ *     4. [dD] Get/set L2 on/off signal (0..1)
+ *     5. [nN] Get/set neutral bias (+- 200)
+ *     6. [oO] Get/set main on/off signal (0..1)
+ *     7. [fF] Get/set output frequency (4000..7000 cHz) (40..70 Hz)
+ *     8. [sS] Get/set switching frequency (1..2000) kHz
+ *     9. [zZ] Get/set switching frequency dither (-25..15)
+ *             [-25..-1] are for down spread of -2.5% to -0.1%
+ *             [1..15] are for center spread of +/-0.1% to +/-1.5%
+ *    10. [gG] Get/set switching clock src; s or S for Si5351, t or T for TC
+ *    11. [hH] Get/set sine clock src; s or S for Si5351, t or T for TC
  * 
  * TODO: Devise a start up sequence that will prime the bootstrap
  * capacitor.  To do this, generate a low reference, and enable the
@@ -72,14 +115,30 @@
  * hardware to turn on the lower MOSFET Q2 long enough to charge up
  * the bootstrap capacitor, after which the inverter should be able
  * to start and run normally.
+ * 
  */
 
 int firstVariable = 4321;
 
 #include <Arduino.h>
-// #include <IcosaLogic_SAMD_Dumpster.h>          // this is not released yet
+#include <Wire.h>
+#include <SAMD51_Dumpster.h>      // Debug code,  comment out for production
+#include "si5351.h"               // Etherkit_Si351 works, no spread spectrum
+                                  // PU2REO_Si5351ArduinoLite is similar (Si5351A only 3 outputs)
+#include <CRC8.h>
+
+bool si5351Ready      = false;
+bool si5351ClockReady = false;
+bool si5351SineReady  = false;
+bool tcClockReady     = false;
+bool tcSineReady      = false;
+
+Si5351 si5351;
 
 // clock definitions
+uint8_t switchClkSrc = 's';       // s/S for Si5351, t/T for TC instance
+uint8_t sineClkSrc   = 's';       // s/S for Si5351, t/T for TC instance
+
 const uint32_t kHz                      = 1000;
 const uint32_t MHz                      = 1000000;
 
@@ -89,22 +148,32 @@ const uint32_t clkClockSourceFrequency  = 48 * MHz;
 
 // The output and PWM frequencies
 const uint16_t outRmsVoltage = 120;
-const double outputFreq = 60.25;       // 50 or 60, usually
-const uint32_t pwmFreq = 500 * kHz;
+double outputFreq = 60.05;                 // 50 or 60 Hz, usually
+uint16_t outputFreq_cHz = 6005;
+const uint16_t minOutputFreq = 4000;       // 40 Hz in cHz
+const uint16_t maxOutputFreq = 7000;       // 70 Hz in cHz
 
-// Output pins
-uint32_t l1RefPin = DAC0;
-uint32_t l2RefPin = DAC1;
-uint32_t clockPin = A5;
+uint64_t switchFreq = 500 * kHz;
+uint16_t switchFreq_kHz = 500;
+const uint16_t minSwitchFreq = 1;          // 1 kHz
+const uint16_t maxSwitchFreq = 2000;       // 2000 kHz
+
+// Input/Output pins.  These work for both M4 Feather and M4 ItsyBitsy
+uint32_t l1RefPin     = DAC0;          // reference sine wave for L1
+uint32_t l2RefPin     = DAC1;          // reference sine wave for L2
+uint32_t clockPin     = A5;            // output clock signal
+uint32_t sineClkPin   = 9;             // sine clock input pin
+uint32_t l1OnOffPin   = 10;            // on/off signal for L1
+uint32_t l2OnOffPin   = 11;            // on/off signal for L2
+uint32_t mainOnOffPin = 12;            // on/off signal for entire inverter
 
 // loop timing variables
+unsigned long numSeconds = 0;
 unsigned long nextLoopMs = 0;
 const unsigned long intervalMs = 1000;
 
 // on/off signal values
 uint8_t mainOnOff = 0;
-uint8_t l1OnOff = 0;
-uint8_t l2OnOff = 0;
 
 // Since wave generation
 const uint16_t numSamples = 4000;
@@ -114,12 +183,29 @@ const double midDacValue = maxDacValue / 2;
 const uint16_t maxDacAmplitude = midDacValue - 1;
 const uint16_t minDacAmplitude = 0 - maxDacAmplitude;
 double rawSineData[numSamples];
+
+/*
+ * One design assumption is that we have top, mid, and bottom connections to the
+ * battery powering the inverter.  Generally, the mid point of the battery is
+ * connected to neutral of the output.  The neutral bias shifts the reference sine
+ * wave up or down relative to neutral, and can be used as a mechanism to balance
+ * the top and bottom halves of the battery.  An active BMS balancer then only has
+ * to balance across cells in each battery half, rather than across cells in the
+ * entire pack.
+ * 
+ * The neutral bias is applied equally to both L1 and L2.
+ */
+const uint16_t minNeutralBias = -200;
+const uint16_t maxNeutralBias = 200;
 uint16_t neutralBias = 0;
 
 /*
  * Data for generating an output reference sine wave for a single channel.
  * Since each line may have a different load, it will have a different throttle
- * setting, so we need separate arrays for L1 and L2.
+ * setting, so we need separate arrays for L1 and L2.  By having two sine data
+ * arrays, we can calculate a new array without unexpected interaction with the
+ * generation of the sine wave.  After calculation, we change the pointner
+ * sineData to reference the updated data array.
  */
 typedef struct {
   uint16_t throttle;
@@ -128,6 +214,8 @@ typedef struct {
   uint16_t sineDataB[numSamples];
   uint16_t* sineData;
   bool usingDataA;
+  uint8_t onOff;
+  uint8_t onOffPin;
 } LineData;
 
 LineData l1;
@@ -136,13 +224,37 @@ LineData l2;
 const uint16_t maxThrottle = 2047;
 const uint16_t defaultThrottle = 1850;
 
+// Interrupt request handler stats for the timer driving the sine wave generation
+volatile uint32_t tc2IrqNumRaw = 0;
+volatile uint32_t tc2IrqElapsed = 0;
+volatile uint8_t  tc2IrqFlagsLast = 0;
+volatile uint32_t tc2IrqFlagErrors = 0;
 
-volatile uint32_t tc5IrqNumRaw = 0;
-volatile uint32_t tc5IrqElapsed = 0;
-volatile uint8_t  tc5IrqFlagsLast = 0;
-volatile uint32_t tc5IrqFlagErrors = 0;
+volatile uint32_t si5351IrqNumRaw = 0;
+volatile uint32_t si5351IrqElapsed = 0;
 
-// IcosaLogic_SAMD_Dumpster ilsd;
+/*
+ * Definition of requests and response formats between the interface controller
+ * and this driver controller.  The driver controller's main priority is to
+ * deliver quality reference sine waves and clock signal, which is very timing
+ * critical.  The interface controller communicates to this inverter driver, 
+ * battery charge controllers, BMS instances, user display terminals, and smart
+ * load balancers.
+ * 
+ * Requests and responses have the same format and are always 32 bits long in
+ * binary form.  If the communication between the two controllers is over UART,
+ * the in-transit form of the request/response may be converted to ASCII, but
+ * it is converted back to 32-bit binary in the receiver.
+ */
+typedef struct {
+  uint8_t cmd;
+  uint8_t err;
+  uint16_t value;
+} RemoteCmd;
+
+volatile uint32_t invalidCmdErr = 0;
+
+SAMD51_Dumpster ilsd;
 
 /*
  * Initialize the inverter.
@@ -153,8 +265,10 @@ void setup() {
   dumpMemoryAddresses();
   dumpSamdPeripherals();
 
+  setupDigitalPins();
   setupReferenceWaves();
   setupClockOutput();
+  setupComms();
 
   dumpSamdPeripherals();
 
@@ -180,6 +294,19 @@ void setupSerial() {
 }
 
 /*
+ * Setup the digital output pins for the various on/off signals.
+ */
+void setupDigitalPins() {
+  pinMode(l1OnOffPin, OUTPUT);
+  pinMode(l2OnOffPin, OUTPUT);
+  pinMode(mainOnOffPin, OUTPUT);
+  
+  digitalWrite(l1OnOffPin, LOW);
+  digitalWrite(l2OnOffPin, LOW);
+  digitalWrite(mainOnOffPin, LOW);
+}
+
+/*
  * Set up generating the reference sine waves.
  */
 void setupReferenceWaves() {
@@ -192,7 +319,7 @@ void setupReferenceWaves() {
 /*
  * Set up the raw sine wave data.
  * Raw sine wave data over the range 0..2*pi is -1..+1.
- * Adjust those real values to the integer range 0..4095, centered at 2048.
+ * Adjust those real values -1..+1 to the integer range 0..4095, centered at 2048.
  */
 void setupSineData() {
   uint32_t startTicks = DWT->CYCCNT;
@@ -202,7 +329,7 @@ void setupSineData() {
   const double pi2 = 2.0 * pi;
   const double dNumSamples = numSamples;
   
-  // initialize the line struct for L1 and L2
+  // initialize the line structs for L1 and L2
   l1.index = 0;
   l2.index = numSamples / 2;
   l1.throttle = defaultThrottle;
@@ -211,6 +338,10 @@ void setupSineData() {
   l2.usingDataA = 1;
   l1.sineData = l1.sineDataA;
   l2.sineData = l2.sineDataA;
+  l1.onOff = 0;
+  l2.onOff = 0;
+  l1.onOffPin = l1OnOffPin;
+  l2.onOffPin = l2OnOffPin;
   
   for (int i = 0; i < numSamples; i++) {
     rawSineData[i] = sin((double) i * pi2 / dNumSamples);
@@ -227,6 +358,34 @@ void setupSineData() {
 
 /*
  * Update the sine wave array based on current throttle and bias settings.
+ * Note that there are separate throttle settings for each output line.
+ * There is only one bias setting used by both lines.
+ * 
+ * TODO: Add an additional per-line bias setting?
+ * 
+ * The throttle adjusts the amplitude of the sine wave.  With this mechanism
+ * one can adjust the output voltage in software without having to make any
+ * hardware changes.
+ * 
+ * The bias shifts the sine wave up or down by some (usually very small) amount.
+ * The bias has two functions:
+ *     1. To compensate for slight hardware tolerances that may result in
+ *        the output sine wave not being centered at zero volts.
+ *     2. To force the sine wave up or down slightly, to be used as a very
+ *        coarse battery balance mechanism between the top and bottom halves
+ *        of the battery pack.  The BMS can then balance the two halves of
+ *        the battery independently, which is really helpful for active
+ *        balancers moving charge up and down the cell stacks.
+ * 
+ * Currently, the bias is a straight shifting of the sine wave.  This preserves
+ * the harmonic shape of the wave, but it introduces frequency jitter for any
+ * components that are detecting zero crossing of their power source.  If this
+ * frequency jitter is an issue, a solution would be to calculate the upper and
+ * lower lobes of the sine wave by adding the bias to one, and subtracting it
+ * from the other.  This would preserve the zero crossing frequency integrity at
+ * the expense of some minor total harmonic distortion of the sine wave.
+ * 
+ * A final option would be to implement both the shift bias and the amplitude bias.
  */
 void updateSineData(LineData* ld) {
   uint16_t* nextSineData = ld->usingDataA ? ld->sineDataB : ld->sineDataA;
@@ -244,8 +403,6 @@ void updateSineData(LineData* ld) {
   
   ld->usingDataA = !ld->usingDataA;
   ld->sineData = nextSineData;
-  
-  Serial.printf("usingDataA=%d  !usingDataA=%d\n", ld->usingDataA, !ld->usingDataA);
 }
 
 /*
@@ -355,21 +512,39 @@ void analogWriteDac(uint16_t value0, uint16_t value1)
 }
 
 /*
- * Set up the TC5 instance to generate an interrupt at the intervals
+ * Set up the TC2 instance to generate an interrupt at the intervals
  * required for the configured output sine wave frequency.
  */
 void setupSineInterrupt() {
+  if (sineClkSrc == 't' || sineClkSrc == 'T') {
+    // use a TC
+    setupTcSineInterrupt();
+  } else if (sineClkSrc == 's' || sineClkSrc == 'S'){
+    // use the Si5351 chip
+    setupSi5351SineInterrupt();
+  } else {
+    Serial.printf("Error: invalid sineClkSrc value = 0x%x\n", sineClkSrc);
+  }
+}
+
+/*
+ * Set up the TC2 instance to generate an interrupt at the intervals
+ * required for the configured output sine wave frequency.
+ */
+void setupTcSineInterrupt() {
   uint16_t period = (uint16_t) ((double) intrClockSourceFrequency / ((double) numSamples * outputFreq));
+  Serial.printf("numSamples=%d  period=%d  outputFreq=", numSamples, period);
+  Serial.println(outputFreq, 3);
   
-  // First, enable TC5 MCLK APBC interface
-  if (! MCLK->APBCMASK.bit.TC5_) {
-    MCLK->APBCMASK.bit.TC5_ = 1;
+  // First, enable TC2 MCLK APBB interface
+  if (! MCLK->APBBMASK.bit.TC2_) {
+    MCLK->APBBMASK.bit.TC2_ = 1;
   }
 
   // Config the GCLK peripheral controller to use clock generator 1, and enable it
-  GCLK->PCHCTRL[TC5_GCLK_ID].reg = GCLK_PCHCTRL_GEN_GCLK1_Val | (1 << GCLK_PCHCTRL_CHEN_Pos);
+  GCLK->PCHCTRL[TC2_GCLK_ID].reg = GCLK_PCHCTRL_GEN_GCLK1_Val | (1 << GCLK_PCHCTRL_CHEN_Pos);
 
-  Tc* TCx = TC5;                                         // Configure TC5
+  Tc* TCx = TC2;                                         // Configure TC2
 
   TCx->COUNT16.CTRLA.bit.SWRST = 1;                      //reset
   while (TCx->COUNT16.SYNCBUSY.bit.SWRST);
@@ -384,24 +559,26 @@ void setupSineInterrupt() {
   TCx->COUNT16.CC[0].reg = period;
   while (TCx->COUNT16.SYNCBUSY.bit.CC0);
 
-  NVIC_SetPriority(TC5_IRQn, 1);                         // Enable NVIC interrupts for TC5
-  NVIC_EnableIRQ(TC5_IRQn);
+  NVIC_SetPriority(TC2_IRQn, 1);                         // Enable NVIC interrupts for TC2
+  NVIC_EnableIRQ(TC2_IRQn);
   
   TCx->COUNT16.INTENSET.bit.OVF = 1;                     // Enable overflow interrupt
 
   TCx->COUNT16.CTRLA.bit.ENABLE = 1;                     // Enable TCx
   while (TCx->COUNT16.SYNCBUSY.bit.ENABLE);
+  
+  tcSineReady = true;
 }
 
 /*
- * Handler for TC5 interrupts.
+ * Handler for TC2 interrupts.
  */
-void TC5_Handler() {
+void TC2_Handler() {
   uint32_t startTicks = DWT->CYCCNT;
-  tc5IrqNumRaw += 1;
+  tc2IrqNumRaw += 1;
   
-  uint8_t intFlags = TC5->COUNT16.INTFLAG.reg;
-  tc5IrqFlagsLast = intFlags;
+  uint8_t intFlags = TC2->COUNT16.INTFLAG.reg;
+  tc2IrqFlagsLast = intFlags;
   
   if (intFlags & TC_INTENSET_OVF) {
     while ( !DAC->STATUS.bit.READY0 );         // update DAC0 value for line 1
@@ -424,20 +601,117 @@ void TC5_Handler() {
   }
   if (intFlags) {
     // It is unexpected to have any interrupt other than OVF
-    tc5IrqFlagErrors += 1;
+    tc2IrqFlagErrors += 1;
   }
   
   // clear all the pending interrupts
-  TC5->COUNT16.INTFLAG.reg = tc5IrqFlagsLast;
+  TC2->COUNT16.INTFLAG.reg = tc2IrqFlagsLast;
   
-  tc5IrqElapsed += DWT->CYCCNT - startTicks;
+  tc2IrqElapsed += DWT->CYCCNT - startTicks;
+}
+
+/*
+ * Setup the Si5351 to generate interrupts to drive the DAC.
+ */
+void setupSi5351SineInterrupt() {
+  setupSi5351();
+  
+  if (! si5351Ready) {
+    Serial.printf("ERROR: Si5351 is not ready in setupSi5351SineInterrupt\n");
+    return;
+  }
+
+  // ask for 100x higher frequency that we really want.
+  uint64_t sineIntrFreq = (uint64_t) outputFreq_cHz * (uint64_t) numSamples;
+  si5351.set_freq(sineIntrFreq, SI5351_CLK2);       // set up clock 2
+  
+  attachInterrupt(digitalPinToInterrupt(sineClkPin), si5351Sine_Handler, RISING);
+  
+  si5351SineReady = true;
+}
+
+/*
+ * Handler for Si5351 sine interrupts.
+ */
+void si5351Sine_Handler() {
+  uint32_t startTicks = DWT->CYCCNT;
+  si5351IrqNumRaw += 1;
+  
+  while ( !DAC->STATUS.bit.READY0 );         // update DAC0 value for line 1
+  while (DAC->SYNCBUSY.bit.DATA0);
+  DAC->DATA[0].reg = l1.sineData[l1.index];
+  l1.index += 1;
+  if (l1.index >= numSamples) {
+    l1.index = 0;
+  }
+      
+  while ( !DAC->STATUS.bit.READY1 );         // update DAC1 value for line 2
+  while (DAC->SYNCBUSY.bit.DATA1);
+  DAC->DATA[1].reg = l2.sineData[l2.index];
+  l2.index += 1;
+  if (l2.index >= numSamples) {
+    l2.index = 0;
+  }
+      
+  si5351IrqElapsed += DWT->CYCCNT - startTicks;
+}
+
+/*
+ * Disable the sine interrupt.
+ */
+void disableSineInterrupt() {
+  if (sineClkSrc == 't' || sineClkSrc == 'T') {
+    disableTcSineInterrupt();
+  } else if (sineClkSrc == 's' || sineClkSrc == 'S'){
+    disableSi5351SineInterrupt();
+  } else {
+    Serial.printf("Error: invalid sineClkSrc value = 0x%x\n", sineClkSrc);
+  }
+}
+
+/*
+ * Disable the TC based sine interrupt.
+ */
+void disableTcSineInterrupt() {
+  if (tcSineReady) {
+    NVIC_DisableIRQ(TC2_IRQn);
+    tcSineReady = false;
+  }
+}
+
+/*
+ * Disable the Si5351 based sine interrupt by detaching it.
+ */
+void disableSi5351SineInterrupt() {
+  if (si5351SineReady) {
+    detachInterrupt(digitalPinToInterrupt(sineClkPin));
+    // si5351.set_clock_disable(SI5351_CLK2, SI5351_CLK_DISABLE_HI_Z);
+    si5351SineReady = false;
+  }
 }
 
 
 /*
+ * Set up a switching clock output signal using either:
+ * a. A TC peripheral
+ * b. A Si5351 clock chip
+ */
+void setupClockOutput() {
+  if (switchClkSrc == 't' || switchClkSrc == 'T') {
+    // use a TC
+    setupTcClockOutput();
+  } else if (switchClkSrc == 's' || switchClkSrc == 'S'){
+    // use the Si5351
+    setupSi5351ClockOutput();
+  } else {
+    Serial.printf("Error: invalid switchClkSrc value = 0x%x\n", switchClkSrc);
+  }
+}
+
+/*
  * Setup a TC instance for the clock output signal.
  * 
- * These values are for the Feather M4 Express:
+ * These values are for the Feather M4 Express (SAMD51J19A):
  *     TCC0 IOSET 6
  *     TCC1 IOSET 1
  *     TC0 IOSET 1 -- PA04, PA05 pins A4, A1     bus APBA
@@ -447,8 +721,9 @@ void TC5_Handler() {
  *     TC4 IOSET 1 -- PB08, PB09 pins A2, A3     bus APBC
  *     TC5                                       bus APBC
  */
-void setupClockOutput() {
-  uint16_t period = clkClockSourceFrequency / (pwmFreq * 2);
+void setupTcClockOutput() {
+  // The switch frequency will be the clock freq (48MHz) divided by the period
+  uint16_t period = clkClockSourceFrequency / (switchFreq * 2);
   Serial.printf("Setting up clock output: period=%d\n", period);
 
   // Call analogWrite to set up the output pin, then manually set up the TC the way we want it.
@@ -469,25 +744,138 @@ void setupClockOutput() {
   pch->bit.CHEN = 1;
   while (pch->bit.CHEN == 0);
 
-  Tc* TCx = TC1;	                               // Configure TC
+  Tc* TCx = TC1;	                                   // Configure TC
 
-  TCx->COUNT16.CTRLA.bit.SWRST = 1;                    //reset
+  TCx->COUNT16.CTRLA.bit.SWRST = 1;                  //reset
   while (TCx->COUNT16.SYNCBUSY.bit.SWRST);
 
-  TCx->COUNT16.CTRLA.bit.ENABLE = 0;                   // Disable
+  TCx->COUNT16.CTRLA.bit.ENABLE = 0;                 // Disable
   while (TCx->COUNT16.SYNCBUSY.bit.ENABLE);
   
-  TCx->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16;      // Set Timer counter Mode to 16 bits
-  TCx->COUNT16.WAVE.reg = TC_WAVE_WAVEGEN_MFRQ;        // Set match frequency mode
+  TCx->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16;    // Set Timer counter Mode to 16 bits
+  TCx->COUNT16.WAVE.reg = TC_WAVE_WAVEGEN_MFRQ;      // Set match frequency mode
 
-  while (TCx->COUNT16.SYNCBUSY.bit.CC0);	       // Set the period
+  while (TCx->COUNT16.SYNCBUSY.bit.CC0);	           // Set the period
   TCx->COUNT16.CC[0].reg = period;
   while (TCx->COUNT16.SYNCBUSY.bit.CC0);
 
+	TCx->COUNT16.CTRLBCLR.bit.LUPD = 1;                // Enable runtime update of the period
+	while (TCx->COUNT16.SYNCBUSY.bit.CTRLB);
+
   TCx->COUNT16.CTRLA.bit.ENABLE = 1;	               // Enable TCx
   while (TCx->COUNT16.SYNCBUSY.bit.ENABLE);
+  
+  tcClockReady = true;
 }
 
+/*
+ * Initialize a Si5351 clock generator chip.  This function is idempotent,
+ * and may be called for clock output and/or sine wave interrupts.
+ */
+void setupSi5351() {
+  if (si5351Ready) {
+    // already initialized
+    return;
+  }
+  
+  Serial.println("Setting up Si5351 device");
+
+  // Initialize the chip. Zero in the 2nd param below is interpreted
+  // as a 25 MHz crystal input.
+  bool i2c_found = si5351.init(SI5351_CRYSTAL_LOAD_10PF, 0, 0);
+  if (!i2c_found) {
+    Serial.println("Error: Si5351 device not found on I2C bus!");
+    return;
+  }
+  
+  // Always use clock 2 for the sine wave and configure it to run on PLLB
+  // so that if we set spread spectrum (only available on PLLA) for the
+  // output clock, it won't perturb the sine wave output.
+  // si5351.set_ms_source(SI5351_CLK2, SI5351_PLLB);
+  
+  si5351Ready = true;
+}
+
+  
+/*
+ * Set up a Si5351 clock generator chip to generate the switching clock
+ * output. The advantage of this method is greater flexibility in selecting
+ * the output frequency, more precise output, and the ability to turn
+ * on spread spectrum dithering of the clock signal to reduce EMi.
+ * 
+ * Clock output is always on Si5351 clock 0.
+ */
+void setupSi5351ClockOutput() {
+  // If we're switching from TC to Si5351 at run time, configure the
+  // TC output pin to input to force it to high impedance state, so
+  // that it can be wired directly to the Si5351 clock output.
+  pinMode(clockPin, INPUT);
+  
+  setupSi5351();
+  updateSi5351ClockFrequency();
+}
+
+/*
+ * Update the output clock frequency.
+ */
+void updateOutputClockFrequency() {
+  if (switchClkSrc == 't' || switchClkSrc == 'T') {
+    updateTcClockFrequency();
+  } else if (switchClkSrc == 's' || switchClkSrc == 'S'){
+    updateSi5351ClockFrequency();
+  } else {
+    Serial.printf("Error: invalid switchClkSrc value = 0x%x\n", switchClkSrc);
+  }
+}
+
+/*
+ * Update the period in the output clock TC, which will change the output
+ * clock frequency that is generated.  Write the new period to the CCBUF[0]
+ * field, which will get transferred to CC[0] at the next UPDATE condition.
+ * This allows jitter-free updates of the clock frequency at run time.
+ */
+void updateTcClockFrequency() {
+  if (tcClockReady) {
+    // The switch frequency will be the clock freq (48MHz) divided by the period
+    uint16_t period = clkClockSourceFrequency / (switchFreq * 2);
+    Serial.printf("Updating clock output: period=%d\n", period);
+
+    Tc* TCx = TC1;	                                   // Configure TC
+
+	  if (! TCx->COUNT16.STATUS.bit.CCBUFV0) {
+	    TCx->COUNT16.CCBUF[0].reg = period;
+	  }
+  }
+}
+
+/*
+ * If the Si5351 has been set up and is running, update the clock output frequency.
+ */
+void updateSi5351ClockFrequency() {
+  if (si5351Ready) {
+    uint64_t freq0 = switchFreq * 100ULL;      // library sets up for divide by 100
+  
+    si5351.set_freq(freq0, SI5351_CLK0);       // set up clock 0
+  }
+}
+
+void disableClockOutput() {
+  if (switchClkSrc == 't' || switchClkSrc == 'T') {
+    disableTcClockOutput();
+  } else if (switchClkSrc == 's' || switchClkSrc == 'S'){
+    disableSi5351ClockOutput();
+  } else {
+    Serial.printf("Error: invalid switchClkSrc value = 0x%x\n", switchClkSrc);
+  }
+}
+
+void disableTcClockOutput() {
+  // TODO: implement me
+}
+
+void disableSi5351ClockOutput() {
+  // TODO: implement me
+}
 
 /*
  * Dump an address of code, memory and the stack, just to get a feel for where the
@@ -504,9 +892,224 @@ void dumpMemoryAddresses() {
 }
 
 void dumpSamdPeripherals() {
-  // This is not released yet.
-  // ilsd.dumpGCLK(NULL);
-  // ilsd.dumpTC();
+  ilsd.dumpGCLK(NULL);
+  ilsd.dumpMCLK(NULL);
+  ilsd.dumpTC(NULL);
+  ilsd.dumpPort(NULL);
+  ilsd.dumpSERCOM(NULL);
+}
+
+/*
+ * Setup the communication channel to the interface controller.
+ */
+void setupComms() {
+  uint8_t myI2CAddr = 16;
+  Wire.begin(myI2CAddr, true);
+}
+
+/*
+ * Handle receiving a request byte from the inverter interface controller.
+ */
+void recvReqByte_Handler() {
+}
+
+/*
+ * Process a received request.
+ *     1. [aA] Get/set L1 throttle (1..2047)
+ *     2. [bB] Get/set L2 throttle (1..2047)
+ *     3. [cC] Get/set L1 on/off signal (0..1)
+ *     4. [dD] Get/set L2 on/off signal (0..1)
+ *     5. [nN] Get/set neutral bias (+- 200)
+ *     6. [oO] Get/set main on/off signal (0..1)
+ *     7. [fF] Get/set output frequency (4000..7000 cHz) (40.00 .. 70.00 Hz)
+ *     8. [sS] Get/set switching frequency (1..2000) kHz
+ *     9. [zZ] Get/set switching frequency dither (-25..15)
+ *             [-25..-1] are for down spread of -2.5% to -0.1%
+ *             [1..15] are for center spread of +/-0.1% to +/-1.5%
+ *    10. [gG] Get/set switching clock src; s or S for Si5351, t or T for TC
+ *    11. [hH] Get/set sine clock src; s or S for Si5351, t or T for TC
+ */
+void processRequest(RemoteCmd cmd) {
+  uint8_t cmdval = cmd.value | 0x20;     // convert to lower case
+  uint8_t oldval = sineClkSrc | 0x20;
+  
+  switch (cmd.cmd) {
+    case 'a':                            // get L1 throttle
+      cmd.err = 0;
+      cmd.value = l1.throttle;
+      sendResponse(cmd);
+      break;
+    case 'A':                            // set L1 throttle
+      if (cmd.value < 1 || cmd.value > maxThrottle) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        l1.throttle = cmd.value;
+        updateSineData(&l1);
+      }
+      sendResponse(cmd);
+      break;
+    case 'b':                            // get L2 throttle
+      cmd.err = 0;
+      cmd.value = l2.throttle;
+      sendResponse(cmd);
+      break;
+    case 'B':                            // set L2 throttle
+      if (cmd.value < 1 || cmd.value > maxThrottle) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        l2.throttle = cmd.value;
+        updateSineData(&l2);
+      }
+      sendResponse(cmd);
+      break;
+    case 'c':                            // get L1 on/off signal value
+      cmd.err = 0;
+      cmd.value = l1.onOff;
+      sendResponse(cmd);
+      break;
+    case 'C':                            // set L1 on/off signal value
+      if (cmd.value > 1) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        l1.onOff = cmd.value;
+        digitalWrite(l1.onOffPin, l1.onOff);
+      }
+      sendResponse(cmd);
+      break;
+    case 'd':                            // get L2 on/off signal value
+      cmd.err = 0;
+      cmd.value = l2.onOff;
+      sendResponse(cmd);
+      break;
+    case 'D':                            // set L2 on/off signal value
+      if (cmd.value > 1) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        l2.onOff = cmd.value;
+        digitalWrite(l2.onOffPin, l2.onOff);
+      }
+      sendResponse(cmd);
+      break;
+    case 'n':                            // get neutral bias
+      cmd.err = 0;
+      cmd.value = neutralBias;
+      sendResponse(cmd);
+      break;
+    case 'N':                            // set neutral bias
+      if (cmd.value < minNeutralBias || cmd.value > maxNeutralBias) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        neutralBias = cmd.value;
+        updateSineData(&l1);
+        updateSineData(&l2);
+      }
+      sendResponse(cmd);
+      break;
+    case 'o':                            // get main on/off signal value
+      cmd.err = 0;
+      cmd.value = mainOnOff;
+      sendResponse(cmd);
+      break;
+    case 'O':                            // set main on/off signal value
+      // when changing from 0 to 1, do special startup sequence to prime bootstrap capacitor
+      if (cmd.value > 1) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        mainOnOff = cmd.value;
+        digitalWrite(mainOnOffPin, mainOnOff);
+      }
+      sendResponse(cmd);
+      break;
+    case 'f':                            // get output frequency
+      cmd.err = 0;
+      cmd.value = outputFreq_cHz;
+      sendResponse(cmd);
+      break;
+    case 'F':                            // set output frequency
+      if (cmd.value < minOutputFreq || cmd.value > maxOutputFreq) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        outputFreq_cHz = cmd.value;
+        outputFreq = (double) outputFreq_cHz / 100.0;
+        // updateSineClock();
+        // setupSineInterrupt();
+      }
+      sendResponse(cmd);
+      break;
+    case 's':                            // get switching frequency
+      cmd.err = 0;
+      cmd.value = switchFreq_kHz;
+      sendResponse(cmd);
+      break;
+    case 'S':                            // set switching frequency
+      if (cmd.value < minSwitchFreq || cmd.value > maxSwitchFreq) {
+        cmd.err = 1;
+      } else {
+        cmd.err = 0;
+        switchFreq_kHz = cmd.value;
+        switchFreq = switchFreq_kHz * 1000;
+        updateOutputClockFrequency();
+      }
+      sendResponse(cmd);
+      break;
+    case 'g':                            // get switching clock source
+      cmd.err = 0;
+      cmd.value = switchClkSrc;
+      sendResponse(cmd);
+      break;
+    case 'G':                            // set switching clock source
+      oldval = switchClkSrc & 0x20;      // convert to lower case;
+      
+      if (mainOnOff || (cmdval != 's' && cmdval != 't')) {
+        cmd.err = 1;
+      } else if (cmdval != oldval) {
+        cmd.err = 0;
+        disableClockOutput();
+        switchClkSrc = cmd.value;
+        setupClockOutput();
+      }
+      sendResponse(cmd);
+      break;
+    case 'h':                            // get sine clock source
+      cmd.err = 0;
+      cmd.value = sineClkSrc;
+      sendResponse(cmd);
+      break;
+    case 'H':                            // set sine clock source
+      if (mainOnOff || (cmdval != 's' && cmdval != 't')) {
+        cmd.err = 1;
+      } else if (cmdval != oldval) {
+        cmd.err = 0;
+        disableSineInterrupt();
+        sineClkSrc = cmd.value;
+        setupSineInterrupt();
+      }
+      break;
+    default:
+      invalidCmdErr += 1;
+      cmd.err = 1;
+      cmd.value = cmd.cmd;
+      sendResponse(cmd);
+      break;
+  }
+}
+
+/*
+ * Sends a response to the interface controller.
+ */
+void sendResponse(RemoteCmd cmd) {
+  uint16_t cmdSize = sizeof(RemoteCmd);
+  char outBuf[8];
+  memcpy(outBuf, &cmd, cmdSize);
+  // outBuf[cmdSize] = calcCRC8((uint8_t *)outBuf, cmdSize);
+  
 }
 
 /*
@@ -517,26 +1120,34 @@ void dumpSamdPeripherals() {
 void loop() {
   unsigned long curMs = millis();
   if (curMs >= nextLoopMs) {
-    nextLoopMs = curMs + intervalMs;
+    nextLoopMs = nextLoopMs + intervalMs;
+    numSeconds += 1;
 
-    // 120M instr / sec
-    double avgElapsedInstr = (double) tc5IrqElapsed / (double) tc5IrqNumRaw;
+    uint32_t irqNumRaw  = si5351IrqNumRaw;
+    uint32_t irqElapsed = si5351IrqElapsed;
+    if (sineClkSrc == 't' || sineClkSrc == 'T') {
+      irqNumRaw  = tc2IrqNumRaw;
+      irqElapsed = tc2IrqElapsed;
+    }
+    
+    tc2IrqNumRaw = 0;
+    tc2IrqElapsed = 0;
+    si5351IrqNumRaw = 0;
+    si5351IrqElapsed = 0;
+
+    // print the average number of instructions executed by the timer interrupt handler
+    // and the average time to execute the handler
+    uint32_t dHours   = numSeconds / 3600;
+    uint32_t dSeconds = numSeconds - dHours * 3600;
+    uint32_t dMinutes = dSeconds / 60;
+    dSeconds = dSeconds - dMinutes * 60;
+    double avgElapsedInstr = (double) irqElapsed / (double) irqNumRaw;
     double avgElapsedUsec  = avgElapsedInstr * 1e6 / cpuClkFrequency;
-    Serial.printf("In loop:  numIrq=%d  numErrs=%d  avgElapsed=", tc5IrqNumRaw, tc5IrqFlagErrors);
+    Serial.printf("In loop:  %d:%02d:%02d numIrq=%d  numErrs=%d  avgElapsed=",
+                  dHours, dMinutes, dSeconds, irqNumRaw, tc2IrqFlagErrors);
     Serial.print(avgElapsedInstr,3);
     Serial.printf(" instr  ");
     Serial.print(avgElapsedUsec, 6);
     Serial.printf(" us\n");
-    tc5IrqElapsed = 0;
-    tc5IrqNumRaw = 0;
-
-    // delay until the next interval to reduce CPU utilization
-    /* */
-    unsigned long msDelay = nextLoopMs - millis();
-    if (msDelay > 1000) {
-      msDelay = 1000;
-    }
-    delay(msDelay);
-    /* */
   }
 }
