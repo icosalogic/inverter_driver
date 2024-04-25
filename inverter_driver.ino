@@ -1,7 +1,13 @@
 /*
  * Inverter driver app targeted specifically for the SAMD51 processor
- * models that have at least 2 DACs.  SAMD21 processors have only 1 DAC
- * and would thus be able to generate only 1 reference sine wave.
+ * models that have at least 2 DACs.  We go deep down the rabbit hole of
+ * SAMD51 specific peripheral code with this app.
+ * 
+ * SAMD21 processors have only 1 DAC and would thus be able to generate
+ * only 1 reference sine wave.  You could, however, use an inverting unity
+ * gain op amp configuration to generate the 2nd sine wave for the split
+ * phase inverter.  However, as mentioned above, porting this SAMD51
+ * specific code to another processor would be work.
  * 
  * The driver controller's main priority is to deliver quality reference sine
  * waves and the clock signal, which is very timing critical.  A separate
@@ -11,7 +17,8 @@
  * 
  * This app runs in the Arduino environment.
  * 
- * This code has been tested and verified on an Adafruit Feather M4 Express.
+ * This code has been tested and verified on an Adafruit Feather M4 Express
+ * (SAMD51J19A) and an Adafruit ItsyBitsy M4 Express (SAMD51G19A).
  * For other SAMD51 boards, some code changes may be necessary.
  * 
  * This app does 3 tasks:
@@ -86,7 +93,7 @@
  * way to do that is with a dual second order generalized integrator phase lock
  * loop (DSOGI PLL).  This, too, is on the TODO list.
  * 
- * For grid-tie synchronization using a SOGI PLL, see
+ * For an example of grid-tie synchronization using a SOGI PLL, see
  *     https://www.instructables.com/STM32-Duino-Grid-Tie-PLL/
  * 
  * 
@@ -791,7 +798,7 @@ void setupSi5351() {
   // Always use clock 2 for the sine wave and configure it to run on PLLB
   // so that if we set spread spectrum (only available on PLLA) for the
   // output clock, it won't perturb the sine wave output.
-  // si5351.set_ms_source(SI5351_CLK2, SI5351_PLLB);
+  si5351.set_ms_source(SI5351_CLK2, SI5351_PLLB);
   
   si5351Ready = true;
 }
