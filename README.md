@@ -91,10 +91,17 @@ that could interfere with radio broadcasts.
 Having said that, precise control of the switching frequencies is not critical, and for
 lower switching speeds, the SAMD51 TC instance is both flexible and sufficiently accurate.
 
+Note that when using the TC instance to generate the MOSFET switching clock, the period
+you enter is for the clock value to toggle up or down.
+For example, with the 48 MHz input clock, if you want a 1 MHz switching clock, you would
+enter a period of 24.
+This would result in the clock value being high for 24 ticks, then toggling low for 24 more ticks,
+for a total of 48 ticks.
+
 # 4.0 Communications with UI Controller
 
 Precise control of the inverter is critical, so this inverter driver is not burdened
-with providing a UI to the end user, nor monitoring slowly changing values like
+with providing a UI to end users, nor monitoring slowly changing values like
 temperatures, etc.
 Those functions are provided by a separate UI controller, and this section documents
 the messages exchanged between these two machines that allow them to coordinate their activities.
@@ -120,7 +127,7 @@ to change those settings.
 The err field enables the driver controller to indicate there was an anomaly attempting
 to process the sent command.
 
-The value field is set on the response to a get command, and on a set command.
+The value field is valid on a get response, and on a set request.
 
 In the table below, the lower case command letter is always a get command, and the
 upper case letter is used for a set command.

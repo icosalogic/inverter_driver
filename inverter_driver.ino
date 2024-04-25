@@ -256,7 +256,7 @@ volatile uint32_t si5351IrqElapsed = 0;
 typedef struct {
   uint8_t cmd;
   uint8_t err;
-  uint16_t value;
+  int16_t value;
 } RemoteCmd;
 
 volatile uint32_t invalidCmdErr = 0;
