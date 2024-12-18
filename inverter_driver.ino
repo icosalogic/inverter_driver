@@ -1,13 +1,19 @@
 /*
- * Inverter driver app targeted specifically for the SAMD51 processor
- * models that have at least 2 DACs.  We go deep down the rabbit hole of
- * SAMD51 specific peripheral code with this app.
+ * Inverter driver app using a cycle-by-cycle FET switching algorithm.
+ * This implementation is tailored for a split-phase system, which is
+ * predominate in the North American residential market.
  * 
- * SAMD21 processors have only 1 DAC and would thus be able to generate
- * only 1 reference sine wave.  You could, however, use an inverting unity
- * gain op amp configuration to generate the 2nd sine wave for the split
- * phase inverter.  However, as mentioned above, porting this SAMD51
- * specific code to another processor would be work.
+ * This app generates 2 reference sine waves and a FET switching clock.
+ * Each line in the split-phase output is implemented with a gate driver
+ * board that also includes a feedback circuit, where the output voltage
+ * is passed through a resistor divider and compared with the reference
+ * sine wave to generate a signal indicating whether the output voltage
+ * is too high or too low.  That signal is used to switch the FETs during
+ * a FET switching clock low-to-high transition.
+ * 
+ * This app istargeted specifically for the SAMD51 processor models that
+ * have at least 2 DACs.  We go deep down the rabbit hole of SAMD51
+ * specific peripheral code with this app.
  * 
  * The driver controller's main priority is to deliver quality reference sine
  * waves and the clock signal, which is very timing critical.  A separate
@@ -40,12 +46,14 @@
  * SWITCHING CLOCK
  * 
  * The output clock signal is generated one of two ways (slight preference for #1):
+ * 
  *     1. Using the Si5351 clock chip.  This will provide a more precise clock
  *        than using the TC method described below.  For higher frequencies that
  *        might interfere with broadcast radio, the Si5351 can do spread spectrum,
  *        which can keep the communications authorities from knocking on your
  *        door.  Assuming you can find a library that implements it.  (Another
- *        item on my TODO list.)  I use the Adafruit breakout board for testing.
+ *        item on the TODO list.)  The Adafruit breakout board is used for testing.
+ * 
  *     2. Using a TC instance with the 48 MHz clock input with appropriate
  *        settings to get one of the following output frequencies.  Since the
  *        output is toggled in each TC match, the counter value should be 1/2
@@ -102,19 +110,19 @@
  * The dialog between this machine (the inverter driver) and the main
  * controller (the interface controller) will support the following
  * requests:
- *     1. [aA] Get/set L1 throttle (1..2047)
- *     2. [bB] Get/set L2 throttle (1..2047)
- *     3. [cC] Get/set L1 on/off signal (0..1)
- *     4. [dD] Get/set L2 on/off signal (0..1)
- *     5. [nN] Get/set neutral bias (+- 200)
- *     6. [oO] Get/set main on/off signal (0..1)
- *     7. [fF] Get/set output frequency (4000..7000 cHz) (40..70 Hz)
- *     8. [sS] Get/set switching frequency (1..2000) kHz
- *     9. [zZ] Get/set switching frequency dither (-25..15)
+ *  .  1. [aA] Get/set L1 throttle (1..2047)
+ *  .  2. [bB] Get/set L2 throttle (1..2047)
+ *  .  3. [cC] Get/set L1 on/off signal (0..1)
+ *  .  4. [dD] Get/set L2 on/off signal (0..1)
+ *  .  5. [nN] Get/set neutral bias (+- 200)
+ *  .  6. [oO] Get/set main on/off signal (0..1)
+ *  .  7. [fF] Get/set output frequency (4000..7000 cHz) (40..70 Hz)
+ *  .  8. [sS] Get/set switching frequency (1..2000) kHz
+ *  .  9. [zZ] Get/set switching frequency dither (-25..15)
  *             [-25..-1] are for down spread of -2.5% to -0.1%
  *             [1..15] are for center spread of +/-0.1% to +/-1.5%
- *    10. [gG] Get/set switching clock src; s or S for Si5351, t or T for TC
- *    11. [hH] Get/set sine clock src; s or S for Si5351, t or T for TC
+ *  . 10. [gG] Get/set switching clock src; s or S for Si5351, t or T for TC
+ *  . 11. [hH] Get/set sine clock src; s or S for Si5351, t or T for TC
  * 
  * TODO: Devise a start up sequence that will prime the bootstrap
  * capacitor.  To do this, generate a low reference, and enable the
@@ -123,16 +131,23 @@
  * the bootstrap capacitor, after which the inverter should be able
  * to start and run normally.
  * 
+ * If you wanted to use another processor, like the SAMD21:
+ * SAMD21 processors have only 1 DAC and would thus be able to generate
+ * only 1 reference sine wave.  You could, however, use an inverting unity
+ * gain op amp configuration to generate the 2nd sine wave for the split
+ * phase inverter.  However, as mentioned above, porting this SAMD51
+ * specific code to another processor would be work.
+ * 
  */
 
 int firstVariable = 4321;
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <SAMD51_Dumpster.h>      // Debug code,  comment out for production
 #include "si5351.h"               // Etherkit_Si351 works, no spread spectrum
                                   // PU2REO_Si5351ArduinoLite is similar (Si5351A only 3 outputs)
-#include <CRC8.h>
+#include <CRC.h>
+#include <Base64.h>
 
 bool si5351Ready      = false;
 bool si5351ClockReady = false;
@@ -256,10 +271,23 @@ volatile uint32_t si5351IrqElapsed = 0;
 typedef struct {
   uint8_t cmd;
   uint8_t err;
-  int16_t value;
+  int32_t value;  // or int16_t[2]?
 } RemoteCmd;
 
+
 volatile uint32_t invalidCmdErr = 0;
+
+// Buffer for communicating to/from the main controller.
+const uint8_t cbufSize = 64;
+const uint8_t cmdSizeEnc = (sizeof(RemoteCmd) + 2) / 3 * 4;
+const uint8_t crcSize = sizeof(uint32_t);
+const uint8_t crcSizeEnc = (crcSize + 2) / 3 * 4;
+const uint8_t cmdSizeChk = cmdSizeEnc + crcSizeEnc;
+
+char cbuf[cbufSize];
+char *cbufPtr = &cbuf[0];
+
+RemoteCmd inCmd;
 
 SAMD51_Dumpster ilsd;
 
@@ -279,6 +307,8 @@ void setup() {
 
   dumpSamdPeripherals();
 
+  testSerial();
+  
   Serial.printf("Setup complete:\n\n");
 }
 
@@ -910,14 +940,40 @@ void dumpSamdPeripherals() {
  * Setup the communication channel to the interface controller.
  */
 void setupComms() {
-  uint8_t myI2CAddr = 16;
-  Wire.begin(myI2CAddr, true);
+  Serial1.begin(115200);
 }
 
 /*
- * Handle receiving a request byte from the inverter interface controller.
+ * Handle receiving request byte(s) from the inverter interface controller.
  */
-void recvReqByte_Handler() {
+void recvReqByte_Handler(int numBytes) {
+  Serial.printf("reading %d bytes into buffer containing %d bytes\n", numBytes, cbufPtr - cbuf);
+  // read numBytes into cbuf
+  int recvdBytes = Serial1.readBytes(cbufPtr, numBytes);
+  cbufPtr += recvdBytes;
+  int bufBytes = cbufPtr - cbuf;
+  
+  // if we have enough bytes for a command, process it
+  if (bufBytes >= cmdSizeChk) {
+    recvRequest(&cbuf[0]);
+    
+    // Copy any additional chars from the end to the front of the buffer,
+    // in case we get multiple commands at once.
+    char* src = &cbuf[cmdSizeChk];
+    char* dst = &cbuf[0];
+    while (src < cbufPtr) {
+      char ch = *src++;
+      // stop at null char
+      if (ch == '\0') {
+        break;
+      }
+      // don't copy CR, LF or space
+      if (ch != '\n' && ch != '\r' && ch != ' ') {
+        *dst++ = ch;
+      }
+    }
+    cbufPtr = dst;
+  }
 }
 
 /*
@@ -936,114 +992,115 @@ void recvReqByte_Handler() {
  *    10. [gG] Get/set switching clock src; s or S for Si5351, t or T for TC
  *    11. [hH] Get/set sine clock src; s or S for Si5351, t or T for TC
  */
-void processRequest(RemoteCmd cmd) {
-  uint8_t cmdval = cmd.value | 0x20;     // convert to lower case
+void processRequest(RemoteCmd *cmd) {
+  uint8_t cmdval = cmd->value | 0x20;     // convert to lower case
   uint8_t oldval = sineClkSrc | 0x20;
   
-  switch (cmd.cmd) {
+  switch (cmd->cmd) {
     case 'a':                            // get L1 throttle
-      cmd.err = 0;
-      cmd.value = l1.throttle;
+      cmd->err = 0;
+      cmd->value = l1.throttle;
       sendResponse(cmd);
       break;
     case 'A':                            // set L1 throttle
-      if (cmd.value < 1 || cmd.value > maxThrottle) {
-        cmd.err = 1;
+      if (cmd->value < 1 || cmd->value > maxThrottle) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        l1.throttle = cmd.value;
+        cmd->err = 0;
+        l1.throttle = cmd->value;
         updateSineData(&l1);
       }
       sendResponse(cmd);
       break;
     case 'b':                            // get L2 throttle
-      cmd.err = 0;
-      cmd.value = l2.throttle;
+      cmd->err = 0;
+      cmd->value = l2.throttle;
       sendResponse(cmd);
       break;
     case 'B':                            // set L2 throttle
-      if (cmd.value < 1 || cmd.value > maxThrottle) {
-        cmd.err = 1;
+      if (cmd->value < 1 || cmd->value > maxThrottle) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        l2.throttle = cmd.value;
+
+        cmd->err = 0;
+        l2.throttle = cmd->value;
         updateSineData(&l2);
       }
       sendResponse(cmd);
       break;
     case 'c':                            // get L1 on/off signal value
-      cmd.err = 0;
-      cmd.value = l1.onOff;
+      cmd->err = 0;
+      cmd->value = l1.onOff;
       sendResponse(cmd);
       break;
     case 'C':                            // set L1 on/off signal value
-      if (cmd.value > 1) {
-        cmd.err = 1;
+      if (cmd->value > 1) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        l1.onOff = cmd.value;
+        cmd->err = 0;
+        l1.onOff = cmd->value;
         digitalWrite(l1.onOffPin, l1.onOff);
       }
       sendResponse(cmd);
       break;
     case 'd':                            // get L2 on/off signal value
-      cmd.err = 0;
-      cmd.value = l2.onOff;
+      cmd->err = 0;
+      cmd->value = l2.onOff;
       sendResponse(cmd);
       break;
     case 'D':                            // set L2 on/off signal value
-      if (cmd.value > 1) {
-        cmd.err = 1;
+      if (cmd->value > 1) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        l2.onOff = cmd.value;
+        cmd->err = 0;
+        l2.onOff = cmd->value;
         digitalWrite(l2.onOffPin, l2.onOff);
       }
       sendResponse(cmd);
       break;
     case 'n':                            // get neutral bias
-      cmd.err = 0;
-      cmd.value = neutralBias;
+      cmd->err = 0;
+      cmd->value = neutralBias;
       sendResponse(cmd);
       break;
     case 'N':                            // set neutral bias
-      if (cmd.value < minNeutralBias || cmd.value > maxNeutralBias) {
-        cmd.err = 1;
+      if (cmd->value < minNeutralBias || cmd->value > maxNeutralBias) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        neutralBias = cmd.value;
+        cmd->err = 0;
+        neutralBias = cmd->value;
         updateSineData(&l1);
         updateSineData(&l2);
       }
       sendResponse(cmd);
       break;
     case 'o':                            // get main on/off signal value
-      cmd.err = 0;
-      cmd.value = mainOnOff;
+      cmd->err = 0;
+      cmd->value = mainOnOff;
       sendResponse(cmd);
       break;
     case 'O':                            // set main on/off signal value
       // when changing from 0 to 1, do special startup sequence to prime bootstrap capacitor
-      if (cmd.value > 1) {
-        cmd.err = 1;
+      if (cmd->value > 1) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        mainOnOff = cmd.value;
+        cmd->err = 0;
+        mainOnOff = cmd->value;
         digitalWrite(mainOnOffPin, mainOnOff);
       }
       sendResponse(cmd);
       break;
     case 'f':                            // get output frequency
-      cmd.err = 0;
-      cmd.value = outputFreq_cHz;
+      cmd->err = 0;
+      cmd->value = outputFreq_cHz;
       sendResponse(cmd);
       break;
     case 'F':                            // set output frequency
-      if (cmd.value < minOutputFreq || cmd.value > maxOutputFreq) {
-        cmd.err = 1;
+      if (cmd->value < minOutputFreq || cmd->value > maxOutputFreq) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        outputFreq_cHz = cmd.value;
+        cmd->err = 0;
+        outputFreq_cHz = cmd->value;
         outputFreq = (double) outputFreq_cHz / 100.0;
         // updateSineClock();
         // setupSineInterrupt();
@@ -1051,72 +1108,201 @@ void processRequest(RemoteCmd cmd) {
       sendResponse(cmd);
       break;
     case 's':                            // get switching frequency
-      cmd.err = 0;
-      cmd.value = switchFreq_kHz;
+      cmd->err = 0;
+      cmd->value = switchFreq_kHz;
       sendResponse(cmd);
       break;
     case 'S':                            // set switching frequency
-      if (cmd.value < minSwitchFreq || cmd.value > maxSwitchFreq) {
-        cmd.err = 1;
+      if (cmd->value < minSwitchFreq || cmd->value > maxSwitchFreq) {
+        cmd->err = 1;
       } else {
-        cmd.err = 0;
-        switchFreq_kHz = cmd.value;
+        cmd->err = 0;
+        switchFreq_kHz = cmd->value;
         switchFreq = switchFreq_kHz * 1000;
         updateOutputClockFrequency();
       }
       sendResponse(cmd);
       break;
     case 'g':                            // get switching clock source
-      cmd.err = 0;
-      cmd.value = switchClkSrc;
+      cmd->err = 0;
+      cmd->value = switchClkSrc;
       sendResponse(cmd);
       break;
     case 'G':                            // set switching clock source
       oldval = switchClkSrc & 0x20;      // convert to lower case;
       
       if (mainOnOff || (cmdval != 's' && cmdval != 't')) {
-        cmd.err = 1;
+        cmd->err = 1;
       } else if (cmdval != oldval) {
-        cmd.err = 0;
+        cmd->err = 0;
         disableClockOutput();
-        switchClkSrc = cmd.value;
+        switchClkSrc = cmd->value;
         setupClockOutput();
       }
       sendResponse(cmd);
       break;
     case 'h':                            // get sine clock source
-      cmd.err = 0;
-      cmd.value = sineClkSrc;
+      cmd->err = 0;
+      cmd->value = sineClkSrc;
       sendResponse(cmd);
       break;
     case 'H':                            // set sine clock source
       if (mainOnOff || (cmdval != 's' && cmdval != 't')) {
-        cmd.err = 1;
+        cmd->err = 1;
       } else if (cmdval != oldval) {
-        cmd.err = 0;
+        cmd->err = 0;
         disableSineInterrupt();
-        sineClkSrc = cmd.value;
+        sineClkSrc = cmd->value;
         setupSineInterrupt();
       }
       break;
     default:
       invalidCmdErr += 1;
-      cmd.err = 1;
-      cmd.value = cmd.cmd;
+      cmd->err = 1;
+      cmd->value = cmd->cmd;
       sendResponse(cmd);
       break;
   }
 }
 
 /*
+ * Recieves a request from the interface controller.
+ */
+void recvRequest(char* buf) {
+  dumpEncodedCmd(buf, "Request Enc");
+  
+  uint32_t crcVal = calcCRC32((uint8_t*)buf, cmdSizeEnc);
+  if (crcVal != buf[cmdSizeEnc]) {
+    invalidCmdErr += 1;
+    Serial.printf("checksum validation error\n");
+  } else {
+    // checksum is good, decode the command and process it
+    Base64.decode((char*) &inCmd, buf, cmdSizeEnc);
+    dumpRemoteCmd(&inCmd, "Request Raw");
+    processRequest(&inCmd);
+  }
+}
+
+/*
  * Sends a response to the interface controller.
  */
-void sendResponse(RemoteCmd cmd) {
-  uint16_t cmdSize = sizeof(RemoteCmd);
-  char outBuf[8];
-  memcpy(outBuf, &cmd, cmdSize);
-  // outBuf[cmdSize] = calcCRC8((uint8_t *)outBuf, cmdSize);
+void sendResponse(RemoteCmd *cmd) {
+  dumpRemoteCmd(cmd, "Response Raw");
   
+  char outBuf[16];
+  
+  memset(outBuf, 0, sizeof(outBuf));                                 // zero the buffer
+  Base64.encode(outBuf, (char*) cmd, sizeof(RemoteCmd));             // encode to base64
+  outBuf[cmdSizeEnc] = calcCRC32((uint8_t *)outBuf, cmdSizeEnc);     // add checksum
+  
+  dumpEncodedCmd(outBuf, "Response Enc");
+  
+  Serial1.print(outBuf);                                             // write data
+  Serial1.flush();
+}
+
+/*
+ * Print a remote command.
+ */
+void dumpRemoteCmd(RemoteCmd* rc, const char* msg) {
+  Serial.printf("%s: ", msg != NULL ? msg : "RemoteCmd");
+  
+  uint8_t ch = rc->cmd;
+  if (ch < ' ' || ch > '~') {
+    ch = '.';
+  }
+  Serial.printf(" cmd=%c [%02x] err=%d val=%d\n", ch, rc->cmd, rc->err, rc->value);
+}
+
+/*
+ * Dump a RemoteCmd that is base64-encoded, and has a CRC checksum byte.
+ */
+void dumpEncodedCmd(char* ec, const char* msg) {
+  printf("%s: ", msg != NULL ? msg : "EncodedCmd");
+  
+  for (char* p = cbuf; p < cbuf + cmdSizeChk; p++) {
+    if (*p >= ' ' && *p <= '~') {
+      printf("%c", *p);
+    } else {
+      printf(" %02x ", *p);
+    }
+  }
+  printf("\n");
+}
+
+/*
+ * Test serialization and CRC for serial I/O
+ */
+void testSerial() {
+  uint8_t errCnt = 0;
+  
+  Serial.printf("sizeof(RemoteCmd)=%d enc=%d chk=%d\n", sizeof(RemoteCmd), cmdSizeEnc, cmdSizeChk);
+  
+  // Build test command
+  inCmd.cmd = 'S';    // set output frequency
+  inCmd.err = 0;
+  inCmd.value = 5432; // 54.32 Hz in cHz
+  dumpRemoteCmd(&inCmd, "TestCmd");
+  
+  // Test serialization
+  char outputBuf[32];
+  memset(outputBuf, 0, sizeof(outputBuf));
+  
+  int result = Base64.encode(outputBuf, (char*) &inCmd, sizeof(RemoteCmd));          // encode to base64
+  Serial.printf("encode result=%d input=", result);
+  Serial.printf(" output=%s\n", outputBuf);
+  if (result != cmdSizeEnc) {
+    Serial.printf("Error: encode1 length mismatch: expected %d got %d\n", cmdSizeEnc, result);
+    errCnt += 1;
+  }
+
+  uint32_t crcVal = calcCRC32((uint8_t*)outputBuf, cmdSizeEnc);
+  
+  Serial.printf("crcVal=%d %08x\n", crcVal, crcVal);
+  result = Base64.encode(outputBuf + cmdSizeEnc, (char*) &crcVal, sizeof(uint32_t));
+  Serial.printf("result=%d enc+crc=%s\n", result, outputBuf);
+  
+  if (result != crcSizeEnc) {
+    Serial.printf("Error: encode2 length mismatch: expected %d got %d\n", cmdSizeEnc, result);
+    errCnt += 1;
+  }
+
+  if (strlen(outputBuf) != cmdSizeChk) {
+    Serial.printf("Error: enc+crc length mismatch: expected %d got %d\n", cmdSizeChk, strlen(outputBuf));
+    errCnt += 1;
+  }
+
+  // Test decoding
+  uint32_t inCrc;
+  result = Base64.decode((char*) &inCrc, outputBuf + cmdSizeEnc, crcSizeEnc);
+  if (result != sizeof(inCrc)) {
+    Serial.printf("Error: decode1 length mismatch: expected %d got %d\n", sizeof(inCrc), result);
+    errCnt += 1;
+  }
+  if (inCrc != crcVal) {
+    Serial.printf("Error: decoded CRC mismatch: expected %d got %d\n", crcVal, inCrc);
+    errCnt += 1;
+  }
+  
+  RemoteCmd xCmd;
+  memset(&xCmd, 0, sizeof(RemoteCmd));
+
+  result = Base64.decode((char*) &xCmd, outputBuf, cmdSizeEnc);
+  if (sizeof(RemoteCmd) != result) {
+    Serial.printf("Error: decode2 length mismatch: expected %d got %d\n", sizeof(RemoteCmd), result);
+    errCnt += 1;
+  }
+  
+  dumpRemoteCmd(&xCmd, "Result");
+
+  if (xCmd.cmd != inCmd.cmd ||
+      xCmd.err != inCmd.err ||
+      xCmd.value != inCmd.value) {
+    Serial.printf("Error: deserialized cmd mismatch\n");
+    errCnt += 1;
+  }
+
+  Serial.printf("test %s  errCnt=%d\n", errCnt == 0 ? "passed" : "failed", errCnt);
 }
 
 /*
@@ -1126,6 +1312,10 @@ void sendResponse(RemoteCmd cmd) {
  */
 void loop() {
   unsigned long curMs = millis();
+  int numBytes = Serial1.available();
+  if (numBytes) {
+    recvReqByte_Handler(numBytes);
+  }
   if (curMs >= nextLoopMs) {
     nextLoopMs = nextLoopMs + intervalMs;
     numSeconds += 1;
@@ -1156,5 +1346,9 @@ void loop() {
     Serial.printf(" instr  ");
     Serial.print(avgElapsedUsec, 6);
     Serial.printf(" us\n");
+    
+    Serial1.printf("In loop:  %d:%02d:%02d numIrq=%d\n",
+                  dHours, dMinutes, dSeconds, irqNumRaw);
+
   }
 }

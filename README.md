@@ -1,7 +1,10 @@
 # 1.0 Inverter Driver
 
 This app generates reference sine waves and the MOSFET switching clock for a split-phase inverter.
-This implementation is targeted specifically to SAMD51 boards, and is rather hardware specific.
+The inverter-driver does not use PWM.  Instead, it performs a cycle-by-cycle comparison of a
+reference sine wave against a feedback signal from the output line, then determines whether to
+turn on the high-side or low-side MOSFET.
+This implementation is targeted specifically to SAMD51 boards.
 
 # 2.0 Reference Sine Waves
 
@@ -20,6 +23,11 @@ The double precision floating point value for each sine value is in the range -1
 Each line has two 4000 entry arrays of uint16_t (unsigned 16-bit integers).
 The 180 degree phase difference between the two output lines is created by initializing
 line 1 index into the array with the value 0, and the line 2 index with 2000.
+We use interrupts at a given frequency to update the DAC value to the current value
+in the integer array.
+After updating the DAC, the interrupt handler increments the index into the array,
+and when it reaches the end, the index is set back to zero.
+See the frequency section below for how these interrupts are generated.
 
 The values in these integer arrays is computed as follows:
 1. By multiplying the raw sine value by a throttle value ranging from 1..2047
@@ -32,12 +40,12 @@ hardware tolerances that may cause the output voltage to not match the desired v
 
 The bias can adjust the center of the output sine wave up or down, also to compensate for
 potential hardware tolerances, and to provide a coarse mechanism to balance the top and
-bottom halves of the battery
+bottom halves of the battery.
 
 There are two arrays for each line, A and B.  If a line is using one of the arrays, and
 the bias or throttle changes, which requires new array values to be computed, the new
 values are computed into the other array.
-Once all the values are recomputed, the line will be pointed to the other array.
+Once all the values are recomputed, the line will be pointed to the updated array.
 
 ## 2.2 Sine Wave Frequency
 
@@ -57,7 +65,7 @@ If you want precise control over your output frequency, we strongly recommend us
 Si5351 clock chip.
 The parts are inexpensive if you want to build your own board, or you can buy an inexpensive
 breakout board from Adafruit.
-Or you can buy an unbelievably cheap breakout board from AliExpress
+Or, you can buy an unbelievably cheap breakout board from AliExpress
 that appears to be created from Adafruit's open source board design.
 Our testing was done with the Adafruit Si5351 breakout board.
 We use the Etherkit_Si5351 Arduino library.
@@ -68,7 +76,7 @@ Note that we configure the sine wave clock to use Si5351 Clock 2, which is set t
 PLLA is used for the MOSFET switching clock (see below), and it supports spread spectrum,
 PLLB does not.
 Assuming spread spectrum is ever enabled for the switching clock, we would not want it to affect
-the reference sine waves.
+the reference sine waves, thus the rationale to use PLLB.
 
 Alternately, the driver can generate the sine wave interrupts using a SAMD51 TC instance doing
 a divide of the 48 MHz clock.
