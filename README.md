@@ -4,7 +4,12 @@ This app generates reference sine waves and the MOSFET switching clock for a spl
 The inverter-driver does not use PWM.  Instead, it performs a cycle-by-cycle comparison of a
 reference sine wave against a feedback signal from the output line, then determines whether to
 turn on the high-side or low-side MOSFET.
-This implementation is targeted specifically to SAMD51 boards.
+
+If you are looking for a sophisticated inverter implementation that uses PWM with either half-bridge
+or T-type hardware configurations, please take a look
+at ![IcosaLogic_Inverter_PWM project](https://github.com/icosalogic/IcosaLogic_Inverter_PWM).
+
+The inverter driver implementation here is targeted specifically to SAMD51 boards.
 
 # 2.0 Reference Sine Waves
 
